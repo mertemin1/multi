@@ -15,4 +15,20 @@
         <artifactId>jSerialComm</artifactId>
         <version>2.10.3</version>
     </dependency>
+
+    <!-- Otomatik birim testleri için JUnit 5 -->
+    <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>5.11.3</version>
+        <scope>test</scope>
+    </dependency>
+
+    <!-- Property-based testler için jqwik -->
+    <dependency>
+        <groupId>net.jqwik</groupId>
+        <artifactId>jqwik</artifactId>
+        <version>1.8.0</version>
+        <scope>test</scope>
+    </dependency>
 </dependencies>
