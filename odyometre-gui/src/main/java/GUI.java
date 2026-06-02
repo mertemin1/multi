@@ -8,9 +8,15 @@ import javafx.scene.control.*;
 import javafx.scene.layout.*;
 import javafx.stage.Stage;
 
+import com.odyometre.core.algorithm.FrequencyManager;
+import com.odyometre.core.algorithm.HughsonWestlakeEngine;
+import com.odyometre.core.model.TestConfig;
+import com.odyometre.core.model.TestState;
+
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -19,17 +25,25 @@ import java.util.stream.Collectors;
  */
 public class GUI extends Application {
 
+    public enum Ear {
+        RIGHT, LEFT
+    }
+
     private static final int[] STANDARD_FREQUENCIES = {250, 500, 1000, 2000, 4000, 8000};
 
     private final SerialManager serialManager = new SerialManager();
     private final Map<Integer, Integer> rightThresholds = new HashMap<>();
     private final Map<Integer, Integer> leftThresholds = new HashMap<>();
 
-    private HughsonWestlakeState hwState;
+    private TestState currentTestState;
+    private TestConfig hwConfig = TestConfig.defaultASHA();
+    private Ear currentEar;
+    private boolean isFirst1000HzDone = false;
+    private boolean testFinished = false;
 
     private ComboBox<String> portCombo;
     private ToggleGroup modeGroup;
-    private ComboBox<HughsonWestlakeState.Ear> earCombo;
+    private ComboBox<Ear> earCombo;
     private ComboBox<Integer> frequencyCombo;
     private Slider intensitySlider;
     private Label intensityValueLabel;
@@ -53,7 +67,7 @@ public class GUI extends Application {
     public void start(Stage stage) {
         serialManager.setResponseCallback(() -> Platform.runLater(() -> {
             appendLog("Hardware RESPONSE — counted as Heard.");
-            if (isHughsonWestlakeMode() && hwState != null && !hwState.isFinished()) {
+            if (isHughsonWestlakeMode() && !testFinished && currentTestState != null) {
                 applyHughsonWestlakeResponse(true);
             }
         }));
@@ -109,8 +123,8 @@ public class GUI extends Application {
         hwMode.setOnAction(e -> updateModePanels());
 
         earCombo = new ComboBox<>();
-        earCombo.getItems().addAll(HughsonWestlakeState.Ear.RIGHT, HughsonWestlakeState.Ear.LEFT);
-        earCombo.setValue(HughsonWestlakeState.Ear.RIGHT);
+        earCombo.getItems().addAll(Ear.RIGHT, Ear.LEFT);
+        earCombo.setValue(Ear.RIGHT);
 
         HBox modeRow = new HBox(20,
                 new Label("Mode:"), manualMode, hwMode,
@@ -140,8 +154,8 @@ public class GUI extends Application {
         frequencyCombo.setValue(1000);
 
         intensitySlider = new Slider(
-                HughsonWestlakeState.MIN_DB,
-                HughsonWestlakeState.MAX_DB,
+                hwConfig.minDb(),
+                hwConfig.maxDb(),
                 30);
         intensitySlider.setShowTickLabels(true);
         intensitySlider.setShowTickMarks(true);
@@ -292,55 +306,77 @@ public class GUI extends Application {
     }
 
     private void startHughsonWestlakeTest() {
-        HughsonWestlakeState.Ear ear = earCombo.getValue();
+        Ear ear = earCombo.getValue();
         if (ear == null) {
             appendLog("Select an ear.");
             return;
         }
-        hwState = HughsonWestlakeState.start(ear, STANDARD_FREQUENCIES);
-        syncThresholdsFromState(hwState);
+        currentEar = ear;
+        isFirst1000HzDone = false;
+        testFinished = false;
+
+        if (currentEar == Ear.RIGHT) {
+            rightThresholds.clear();
+        } else {
+            leftThresholds.clear();
+        }
+
+        currentTestState = TestState.initial(1000, hwConfig.startIntensityDb());
+
+        refreshAudiogram();
         updateHwStatusLabel();
         sendCurrentHwStimulus();
         appendLog("Hughson–Westlake test started for " + ear + " ear.");
     }
 
     private void applyHughsonWestlakeResponse(boolean heard) {
-        if (hwState == null || hwState.isFinished()) {
+        if (testFinished || currentTestState == null) {
             appendLog("Start a Hughson–Westlake test first.");
             return;
         }
-        hwState = HughsonWestlakeEngine.applyResponse(hwState, heard);
-        syncThresholdsFromState(hwState);
-        refreshAudiogram();
-        updateHwStatusLabel();
 
-        if (hwState.isFinished()) {
-            appendLog("Test finished for " + hwState.getEar() + " ear. Thresholds recorded.");
-            showInfo("Test complete",
-                    hwState.getEar() + " ear Hughson–Westlake test is complete.\n"
-                            + formatThresholds(hwState.getThresholds()));
-            return;
+        currentTestState = HughsonWestlakeEngine.applyResponse(currentTestState, heard, hwConfig);
+
+        if (currentTestState.threshold().isPresent()) {
+            int threshold = currentTestState.threshold().get();
+            Map<Integer, Integer> target = currentEar == Ear.RIGHT ? rightThresholds : leftThresholds;
+            target.put(currentTestState.frequency(), threshold);
+
+            refreshAudiogram();
+            appendLog(currentTestState.frequency() + " Hz threshold found: " + threshold + " dB");
+
+            if (currentTestState.frequency() == 1000) {
+                isFirst1000HzDone = true;
+            }
+
+            Optional<Integer> nextFreq = FrequencyManager.getNextFrequency(currentTestState.frequency(), isFirst1000HzDone);
+
+            if (nextFreq.isEmpty()) {
+                testFinished = true;
+                updateHwStatusLabel();
+                appendLog("Test finished for " + currentEar + " ear. Thresholds recorded.");
+                showInfo("Test complete",
+                        currentEar + " ear Hughson–Westlake test is complete.\n"
+                                + formatThresholds(target));
+                return;
+            } else {
+                currentTestState = TestState.initial(nextFreq.get(), hwConfig.startIntensityDb());
+            }
         }
 
+        updateHwStatusLabel();
         sendCurrentHwStimulus();
     }
 
     private void sendCurrentHwStimulus() {
-        if (hwState == null || hwState.isFinished()) {
+        if (testFinished || currentTestState == null) {
             return;
         }
-        int freq = hwState.getCurrentFrequency();
-        int db = hwState.getLevelDb();
+        int freq = currentTestState.frequency();
+        int db = currentTestState.currentIntensityDb();
         serialManager.sendCommand(freq, db);
         appendLog(String.format("Stimulus: %d Hz @ %d dB HL (%s ear)",
-                freq, db, hwState.getEar()));
-    }
-
-    private void syncThresholdsFromState(HughsonWestlakeState state) {
-        Map<Integer, Integer> target =
-                state.getEar() == HughsonWestlakeState.Ear.RIGHT ? rightThresholds : leftThresholds;
-        target.clear();
-        target.putAll(state.getThresholds());
+                freq, db, currentEar));
     }
 
     private void refreshAudiogram() {
@@ -352,27 +388,30 @@ public class GUI extends Application {
     private void resetAllThresholds() {
         rightThresholds.clear();
         leftThresholds.clear();
-        hwState = null;
+        currentTestState = null;
+        testFinished = true;
         refreshAudiogram();
         hwStatusLabel.setText("Thresholds cleared. Press Start to begin a new test.");
         appendLog("Audiogram and test state reset.");
     }
 
     private void updateHwStatusLabel() {
-        if (hwState == null) {
+        if (currentTestState == null) {
             hwStatusLabel.setText("No active test. Press Start to begin.");
             return;
         }
-        if (hwState.isFinished()) {
-            hwStatusLabel.setText("Finished — " + hwState.getEar() + " ear. " + formatThresholds(hwState.getThresholds()));
+        Map<Integer, Integer> target = currentEar == Ear.RIGHT ? rightThresholds : leftThresholds;
+
+        if (testFinished) {
+            hwStatusLabel.setText("Finished — " + currentEar + " ear. " + formatThresholds(target));
             return;
         }
         hwStatusLabel.setText(String.format(
                 "%s ear | %d Hz @ %d dB HL | recorded: %s",
-                hwState.getEar(),
-                hwState.getCurrentFrequency(),
-                hwState.getLevelDb(),
-                formatThresholds(hwState.getThresholds())));
+                currentEar,
+                currentTestState.frequency(),
+                currentTestState.currentIntensityDb(),
+                formatThresholds(target)));
     }
 
     private static String formatThresholds(Map<Integer, Integer> thresholds) {
